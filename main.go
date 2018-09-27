@@ -9,17 +9,93 @@ import (
 	"os"
 	"os/signal"
 	"sort"
+	"sync"
 	"syscall"
+	"time"
 )
 
 // Messages contains all messages
-type Messages map[uint32]Message
+type Messages map[uint32]*Message
 
 // Message is comprised of pkts
 type Message struct {
-	id   uint32        // message id
-	set  map[uint]bool // set used for incoming packets
-	pkts pkt           // packets
+	id            uint32          // message id
+	set           map[uint32]bool // set used for incoming packets
+	pkts          pkts            // packets
+	done          chan bool
+	checkSumTimer *time.Timer
+	mux           *sync.Mutex
+}
+
+func (m *Message) ChecksumTimeout() {
+
+	for {
+		select {
+		case <-m.checkSumTimer.C:
+			m.Checksum()
+			return
+		case <-m.done:
+			return
+		}
+	}
+}
+
+// Add add unique packet to message
+func (m *Message) Add(p pkt) {
+	m.mux.Lock()
+	defer m.mux.Unlock()
+
+	// check dupe
+	if _, ok := m.set[p.offset]; !ok {
+		m.set[p.offset] = true
+		m.pkts = append(m.pkts, p)
+	}
+
+}
+
+// NewMessage makes a new message type
+func NewMessage(id uint32) *Message {
+	t := time.NewTimer(5 * time.Second)
+	done := make(chan bool)
+	m := &Message{id: id, set: map[uint32]bool{}, pkts: []pkt{}, checkSumTimer: t, done: done, mux: &sync.Mutex{}}
+	go m.ChecksumTimeout()
+	return m
+}
+
+// Checksum generates checksum of message
+func (m *Message) Checksum() {
+
+	// sort all our pkts by offset
+	sort.Sort(m.pkts)
+	totalSize := 0
+	payload := []byte{}
+
+	nextOffset := uint32(0)
+	missingOffsets := []uint32{}
+
+	// range over offsets to make sure are all present
+	for _, x := range m.pkts {
+		totalSize += len(x.d)
+		payload = append(payload, x.d...)
+		if nextOffset != x.offset {
+			missingOffsets = append(missingOffsets, nextOffset)
+		}
+		nextOffset = x.offset + uint32(x.s)
+	}
+
+	// any  missing offsets?
+	if len(missingOffsets) > 0 {
+		for _, off := range missingOffsets {
+			fmt.Printf("message %d missing hole %d \n", m.id, off)
+		}
+		return
+	}
+
+	m.checkSumTimer.Stop()
+
+	h := sha256.New()
+	h.Write(payload)
+	fmt.Printf("message: %d size: %d packets: %d sha256: %x \n", m.id, totalSize, len(m.pkts), h.Sum(nil))
 }
 
 // pkt a single udp packet
@@ -30,28 +106,6 @@ type pkt struct {
 }
 
 type pkts []pkt
-
-func (p pkts) Calculate() string {
-	sort.Sort(p)
-	ts := 0
-	b := []byte{}
-
-	nextOffset := uint32(0)
-	for _, x := range p {
-		ts += len(x.d)
-		b = append(b, x.d...)
-		if nextOffset != x.offset {
-			fmt.Printf("hole at %d", nextOffset)
-		} else {
-			nextOffset = x.offset + uint32(x.s)
-		}
-
-	}
-	h := sha256.New()
-	h.Write(b)
-	return fmt.Sprintf("size: %d packets: %d hash: %x ", ts, len(p), h.Sum(nil))
-
-}
 
 func (p pkts) Len() int           { return len(p) }
 func (p pkts) Less(i, j int) bool { return p[i].offset < p[j].offset }
@@ -65,84 +119,65 @@ func main() {
 
 	// start udp server
 	addr := net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 6789}
-	server, err := net.ListenUDP("udp", &addr)
-	defer server.Close()
+	conn, err := net.ListenUDP("udp", &addr)
+	defer conn.Close()
 
-	// check error
+	// fatal error
 	if err != nil {
 		log.Fatal(err)
 	}
 
 	// create data structure
-	offsetsList := map[uint32]pkts{}
-	old := uint32(1)
-	fmt.Println(old)
+	msgs := Messages{}
 
-	go func() {
-		for {
+	// start 4 consumers
+	for i := 0; i < 4; i++ {
+		go func(conn *net.UDPConn) {
+			for {
+				buffer := make([]byte, 512)
+				_, _, err := conn.ReadFromUDP(buffer)
 
-			buffer := make([]byte, 512)
-			read, _, err := server.ReadFromUDP(buffer)
-
-			if err != nil {
-				fmt.Println(read)
-				fmt.Println(err)
-			}
-
-			id, offset, size, data := decomposePkt(buffer)
-
-			if old == id {
-
-				list := offsetsList[id]
-				list = append(list, pkt{offset, size, data})
-				offsetsList[id] = list
-
-			} else {
-
-				//calculate something
-				fmt.Printf("message # %d ", old)
-				fmt.Println(offsetsList[old].Calculate())
-				old = id
-
-				if _, ok := offsetsList[old]; !ok {
-					offsetsList[old] = pkts{pkt{offset, size, data}}
-
+				if err != nil {
+					return
 				}
 
-			}
-		}
-	}()
+				id, pkt := decomposePkt(buffer)
 
-	// values on a channel. We'll create a channel to
-	// receive these notifications (we'll also make one to
-	// notify us when the program can exit).
+				// start populating our map
+				if _, ok := msgs[id]; !ok {
+					msg := NewMessage(id)
+					msgs[msg.id] = msg
+
+					// lets cal checksum the last message
+					if _, ok = msgs[id-1]; ok {
+						msgs[id-1].Checksum()
+					}
+				}
+
+				// add packet to msgs
+				msgs[id].Add(pkt)
+			}
+		}(conn)
+	}
+
+	// handle daemon
 	sigs := make(chan os.Signal, 1)
 	done := make(chan bool, 1)
-
-	// `signal.Notify` registers the given channel to
-	// receive notifications of the specified signals.
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
 
-	// This goroutine executes a blocking receive for
-	// signals. When it gets one it'll print it out
-	// and then notify the program that it can finish.
 	go func() {
 		sig := <-sigs
 		fmt.Println(sig)
 		done <- true
 	}()
 
-	// The program will wait here until it gets the
-	// expected signal (as indicated by the goroutine
-	// above sending a value on `done`) and then exit.
-	fmt.Println("awaiting signal")
+	fmt.Println("awaiting")
 	<-done
 	fmt.Println("exiting")
-	fmt.Println(offsetsList[10].Calculate())
 
 }
 
-func decomposePkt(buffer []byte) (uint32, uint32, uint16, []byte) {
+func decomposePkt(buffer []byte) (uint32, pkt) {
 
 	header, data := buffer[:12], buffer[12:]
 	size := header[2:4]
@@ -153,6 +188,7 @@ func decomposePkt(buffer []byte) (uint32, uint32, uint16, []byte) {
 	i := binary.BigEndian.Uint32(id)
 	o := binary.BigEndian.Uint32(offset)
 	s := binary.BigEndian.Uint16(size)
+	p := pkt{o, s, data[:s]}
 
-	return i, o, s, data[:s]
+	return i, p
 }

@@ -32,14 +32,14 @@ func NewMessages() *Messages {
 	}
 }
 
-// AddMessage ...
+// AddMessage adds a message to messages with a lock
 func (m *Messages) AddMessage(msg *Message) {
 	m.mux.Lock()
 	defer m.mux.Unlock()
 	m.msgs[msg.id] = msg
 }
 
-// GetMessage ...
+// GetMessage gets a message with a lock
 func (m *Messages) GetMessage(id uint32) (*Message, bool) {
 	m.mux.Lock()
 	defer m.mux.Unlock()
@@ -49,7 +49,6 @@ func (m *Messages) GetMessage(id uint32) (*Message, bool) {
 	} else {
 		return msg, true
 	}
-
 }
 
 // Message is comprised of pkts
@@ -57,25 +56,31 @@ type Message struct {
 	id            uint32          // message id
 	set           map[uint32]bool // set used for incoming packets
 	pkts          pkts            // packets
-	done          chan bool
-	checkSumTimer *time.Timer
-	mux           *sync.Mutex
+	checkSumTimer *time.Timer     // timer defaults to 30 seconds
+	mux           *sync.Mutex     // lock
 }
 
+// ChecksumTimeout is the go routine that runs checksum on a message
+// is fired off by a timer
 func (m *Message) ChecksumTimeout() {
 
 	for {
 		select {
 		case <-m.checkSumTimer.C:
-			m.Checksum()
-			return
-		case <-m.done:
+			ck, missing := m.Checksum()
+			if len(missing) != 0 {
+				for _, s := range missing {
+					fmt.Println(s)
+				}
+			} else {
+				fmt.Println(ck)
+			}
 			return
 		}
 	}
 }
 
-// Add add unique packet to message
+// Add unique packet to message
 func (m *Message) Add(p pkt) {
 	m.mux.Lock()
 	defer m.mux.Unlock()
@@ -89,15 +94,15 @@ func (m *Message) Add(p pkt) {
 
 // NewMessage makes a new message type
 func NewMessage(id uint32) *Message {
+
+	// make timer based on flag
 	t := time.NewTimer(*timeOut)
-	done := make(chan bool)
 
 	m := &Message{
 		id:            id,
 		set:           map[uint32]bool{},
 		pkts:          []pkt{},
 		checkSumTimer: t,
-		done:          done,
 		mux:           &sync.Mutex{},
 	}
 
@@ -106,7 +111,8 @@ func NewMessage(id uint32) *Message {
 }
 
 // Checksum generates checksum of message
-func (m *Message) Checksum() {
+// this function runs off a timer
+func (m *Message) Checksum() (string, []string) {
 	m.mux.Lock()
 	defer m.mux.Unlock()
 
@@ -116,30 +122,28 @@ func (m *Message) Checksum() {
 	payload := []byte{}
 
 	nextOffset := uint32(0)
-	missingOffsets := []uint32{}
+	missingOffsets := []string{}
 
-	// range over offsets to make sure all are  present
+	// range over offsets to make sure all are present
 	for _, x := range m.pkts {
 		totalSize += len(x.d)
 		payload = append(payload, x.d...)
 		if nextOffset != x.offset {
-			missingOffsets = append(missingOffsets, nextOffset)
+			s := fmt.Sprintf("message %d missing hole %d \n", m.id, nextOffset)
+			missingOffsets = append(missingOffsets, s)
 		}
 		nextOffset = x.offset + uint32(x.s)
 	}
 
 	// any missing offsets?
 	if len(missingOffsets) > 0 {
-		for _, off := range missingOffsets {
-			fmt.Printf("message %d missing hole %d \n", m.id, off)
-		}
-		return
+		return "", missingOffsets
 	}
 
-	m.checkSumTimer.Stop()
 	h := sha256.New()
 	h.Write(payload)
-	fmt.Printf("message: %d size: %d packets: %d sha256: %x \n", m.id, totalSize, len(m.pkts), h.Sum(nil))
+	checksum := fmt.Sprintf("message: %d size: %d packets: %d sha256: %x \n", m.id, totalSize, len(m.pkts), h.Sum(nil))
+	return checksum, nil
 }
 
 // pkt a single udp packet
@@ -155,15 +159,11 @@ func (p pkts) Len() int           { return len(p) }
 func (p pkts) Less(i, j int) bool { return p[i].offset < p[j].offset }
 func (p pkts) Swap(i, j int)      { p[i], p[j] = p[j], p[i] }
 
-func (p pkt) String() string {
-	return fmt.Sprintf("%d %d %d", p.offset, p.s, len(p.d))
-}
-
+// parsePacket is a helper function
 func parsePacket(buffer []byte) (uint32, pkt, error) {
 
 	if len(buffer) < 12 {
 		return 0, pkt{}, errors.New("buffer header missing")
-
 	}
 
 	header, data := buffer[:12], buffer[12:]
@@ -190,6 +190,7 @@ func main() {
 	defer conn.Close()
 
 	// fatal error
+	// if we can't connect to the port just fail
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -206,13 +207,14 @@ func main() {
 				buffer := make([]byte, 512)
 				read, _, err := conn.ReadFromUDP(buffer)
 
+				// not the most graceful way to stop a go routine
 				if read == 0 || err != nil {
-					fmt.Println("reading from the socket failed")
 					return
 				}
 
 				id, pkt, err := parsePacket(buffer)
 				// buffer isn't correct length
+				// just grab the next pkt might be corrupted data
 				if err != nil {
 					fmt.Println(err)
 					continue
@@ -224,11 +226,6 @@ func main() {
 					msg = NewMessage(id)
 					msgs.AddMessage(msg)
 
-					/*
-						if lstMsg, ok := msgs.GetMessage(id - 1); ok {
-							//lstMsg.Checksum()
-						}
-					*/
 				}
 
 				// add packet to msgs
